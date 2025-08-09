@@ -1,6 +1,6 @@
 # WebGPU Panorama Stitcher (React/Next.js)
 
-Panorama stitching **in the browser** — GPU‑accelerated with **WebGPU** and feature matching/seam finding via **OpenCV.js (4.3.0)**. Drop in a sequence of overlapping photos, watch a progress bar, preview the stitched pano, then **download** or **go back** and tweak settings (feather, seam width).
+Panorama stitching **in the browser** — GPU‑accelerated with **WebGPU** and feature matching/seam finding via **OpenCV.js (4.3.0)**.
 
 ![preview](./preview.png)
 

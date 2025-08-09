@@ -3433,6 +3433,12 @@ export default function WebGPUPanorama() {
                     />
                   </div>
                 </div>
+
+                <div className="mt-6 text-xs text-muted-foreground">
+                  Tip: For best results, supply overlapping images shot from a
+                  fixed rotation (handheld sweep). If WebGPU or OpenCV isn’t
+                  available, the app will fall back to a simple paste.
+                </div>
               </CardContent>
             </Card>
           </motion.div>
@@ -3549,10 +3555,16 @@ export default function WebGPUPanorama() {
         </div>
       )}
 
-      <div className="mt-6 text-xs text-muted-foreground">
-        Tip: For best results, supply overlapping images shot from a fixed
-        rotation (handheld sweep). If WebGPU or OpenCV isn’t available, the app
-        will fall back to a simple paste.
+      <div className="text-center mx-auto mt-8 text-sm text-muted-foreground">
+        Vibe coded with 💙 by{" "}
+        <a
+          href="https://x.com/bringshrubberyy"
+          className="underline hover:text-primary"
+          rel="noopener noreferrer"
+          target="_blank"
+        >
+          Antoni
+        </a>
       </div>
     </div>
   );

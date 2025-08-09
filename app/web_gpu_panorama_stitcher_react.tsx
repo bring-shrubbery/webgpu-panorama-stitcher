@@ -128,7 +128,7 @@ const warpWGSL = /* wgsl */ `
     srcSize : vec2<f32>,
     dstSize : vec2<f32>,
     feather : f32,
-    _pad : f32, // alignment
+    debugMask : f32, // >0.5: visualize mask
   };
   @group(0) @binding(0) var samp : sampler;
   @group(0) @binding(1) var srcTex : texture_2d<f32>;
@@ -164,16 +164,27 @@ const warpWGSL = /* wgsl */ `
 
     // normalized UV for sampling
     let uv = (uvPix + vec2<f32>(0.5, 0.5)) / U.srcSize;
-    let color = textureSampleLevel(srcTex, samp, uv, 0.0);
+  let color = textureSampleLevel(srcTex, samp, uv, 0.0);
 
-    // Sample seam mask in destination space (1: keep this layer, 0: suppress)
-    let maskUV = (vec2<f32>(fragCoord.x, fragCoord.y) + vec2<f32>(0.5, 0.5)) / U.dstSize;
+  // Sample seam mask in destination space (1: keep this layer, 0: suppress)
+  // fragCoord is already at pixel centers in WGSL, so no extra 0.5 offset
+  let maskUV = vec2<f32>(fragCoord.x, fragCoord.y) / U.dstSize;
     let maskV = textureSampleLevel(maskTex, samp, maskUV, 0.0).r;
-    // Use seam mask exclusively to avoid double exposure from per-image edge fading
-    let alpha = clamp(maskV, 0.0, 1.0);
+    var alpha = clamp(maskV, 0.0, 1.0);
 
-    // premultiply so standard alpha blending works
-    return vec4<f32>(color.rgb * alpha, alpha);
+    // Debug: visualize the mask as grayscale
+    if (U.debugMask > 0.5) {
+      return vec4<f32>(vec3<f32>(alpha), 1.0);
+    }
+
+    // Debug: if feather < 0, draw a pure horizontal alpha gradient to test blending
+    if (U.feather < 0.0) {
+      let a = clamp(fragCoord.x / U.dstSize.x, 0.0, 1.0);
+      return vec4<f32>(vec3<f32>(a), a);
+    }
+
+  // Output PREMULTIPLIED alpha; blending configured as one/one-minus-src-alpha
+  return vec4<f32>(color.rgb * alpha, alpha);
   }
 `;
 // Robust coarse-to-fine translation via 1D profile correlation + constrained 2D NCC refine
@@ -2502,21 +2513,24 @@ async function buildSeamMasks(
 ): Promise<(ImageBitmap | null)[]> {
   await loadOpenCV();
   const cv: any = (window as any).cv;
-  if (!cv || !cv.Mat) {
-    debug("buildSeamMasks: OpenCV not ready – skipping");
-    return new Array(bitmaps.length).fill(null);
+  const cvReady = !!(cv && cv.Mat);
+  if (!cvReady) {
+    debug(
+      "buildSeamMasks: OpenCV not ready – using simple linear seam fallback"
+    );
   }
 
   // Column-major -> row-major
+  // Convert column-major (our Float32Array layout) to row-major (OpenCV & our applyR expect row-major)
   const colToRow = (m: Float32Array): number[] => [
     m[0],
-    m[1],
-    m[2],
     m[3],
-    m[4],
-    m[5],
     m[6],
+    m[1],
+    m[4],
     m[7],
+    m[2],
+    m[5],
     m[8],
   ];
   // Row-major 3x3 multiply
@@ -2594,115 +2608,131 @@ async function buildSeamMasks(
     const H_A_roi = mulR(R, HAr);
     const H_B_roi = mulR(R, HBr);
 
-    // Warp both into ROI grid (grayscale)
-    const srcA = bitmapToMat(A);
-    const srcB = bitmapToMat(B);
-    const gA = new cv.Mat();
-    const gB = new cv.Mat();
-    cv.cvtColor(srcA, gA, cv.COLOR_RGBA2GRAY);
-    cv.cvtColor(srcB, gB, cv.COLOR_RGBA2GRAY);
-    srcA.delete();
-    srcB.delete();
-    const size = new cv.Size(ow, oh);
-    const wA = new cv.Mat(oh, ow, cv.CV_8U);
-    const wB = new cv.Mat(oh, ow, cv.CV_8U);
-    const H_A_cv = cv.matFromArray(3, 3, cv.CV_64F, H_A_roi);
-    const H_B_cv = cv.matFromArray(3, 3, cv.CV_64F, H_B_roi);
-    cv.warpPerspective(
-      gA,
-      wA,
-      H_A_cv,
-      size,
-      cv.INTER_LINEAR,
-      cv.BORDER_CONSTANT,
-      new cv.Scalar()
-    );
-    cv.warpPerspective(
-      gB,
-      wB,
-      H_B_cv,
-      size,
-      cv.INTER_LINEAR,
-      cv.BORDER_CONSTANT,
-      new cv.Scalar()
-    );
-    gA.delete();
-    gB.delete();
-    H_A_cv.delete();
-    H_B_cv.delete();
+    // Build seam path: try OpenCV DP on warped overlap; otherwise fallback to a straight midline
+    let seam: Int16Array | null = null;
+    if (cvReady) {
+      try {
+        // Warp both into ROI grid (grayscale)
+        const srcA = bitmapToMat(A);
+        const srcB = bitmapToMat(B);
+        const gA = new cv.Mat();
+        const gB = new cv.Mat();
+        cv.cvtColor(srcA, gA, cv.COLOR_RGBA2GRAY);
+        cv.cvtColor(srcB, gB, cv.COLOR_RGBA2GRAY);
+        srcA.delete();
+        srcB.delete();
+        const size = new cv.Size(ow, oh);
+        const wA = new cv.Mat(oh, ow, cv.CV_8U);
+        const wB = new cv.Mat(oh, ow, cv.CV_8U);
+        const H_A_cv = cv.matFromArray(3, 3, cv.CV_64F, H_A_roi);
+        const H_B_cv = cv.matFromArray(3, 3, cv.CV_64F, H_B_roi);
+        cv.warpPerspective(
+          gA,
+          wA,
+          H_A_cv,
+          size,
+          cv.INTER_LINEAR,
+          cv.BORDER_CONSTANT,
+          new cv.Scalar()
+        );
+        cv.warpPerspective(
+          gB,
+          wB,
+          H_B_cv,
+          size,
+          cv.INTER_LINEAR,
+          cv.BORDER_CONSTANT,
+          new cv.Scalar()
+        );
+        gA.delete();
+        gB.delete();
+        H_A_cv.delete();
+        H_B_cv.delete();
 
-    // Cost map on edge magnitudes (reduces texture-based false positives)
-    const sobelMag = (img: any) => {
-      const gx = new cv.Mat(),
-        gy = new cv.Mat(),
-        ax = new cv.Mat(),
-        ay = new cv.Mat(),
-        mag = new cv.Mat();
-      cv.Sobel(img, gx, cv.CV_16S, 1, 0, 3);
-      cv.Sobel(img, gy, cv.CV_16S, 0, 1, 3);
-      cv.convertScaleAbs(gx, ax);
-      cv.convertScaleAbs(gy, ay);
-      cv.addWeighted(ax, 0.5, ay, 0.5, 0, mag);
-      gx.delete();
-      gy.delete();
-      ax.delete();
-      ay.delete();
-      return mag;
-    };
-    const eA = sobelMag(wA),
-      eB = sobelMag(wB);
-    const diff = new cv.Mat();
-    cv.absdiff(eA, eB, diff);
-    eA.delete();
-    eB.delete();
-    cv.blur(diff, diff, new cv.Size(5, 5));
+        // Cost map on edge magnitudes (reduces texture-based false positives)
+        const sobelMag = (img: any) => {
+          const gx = new cv.Mat(),
+            gy = new cv.Mat(),
+            ax = new cv.Mat(),
+            ay = new cv.Mat(),
+            mag = new cv.Mat();
+          cv.Sobel(img, gx, cv.CV_16S, 1, 0, 3);
+          cv.Sobel(img, gy, cv.CV_16S, 0, 1, 3);
+          cv.convertScaleAbs(gx, ax);
+          cv.convertScaleAbs(gy, ay);
+          cv.addWeighted(ax, 0.5, ay, 0.5, 0, mag);
+          gx.delete();
+          gy.delete();
+          ax.delete();
+          ay.delete();
+          return mag;
+        };
+        const eA = sobelMag(wA),
+          eB = sobelMag(wB);
+        const diff = new cv.Mat();
+        cv.absdiff(eA, eB, diff);
+        eA.delete();
+        eB.delete();
+        cv.blur(diff, diff, new cv.Size(5, 5));
 
-    // DP minimal vertical path (top -> bottom)
-    const W = ow,
-      Hh = oh;
-    const d: Uint8Array = diff.data;
-    const cost = new Float32Array(W * Hh);
-    const back = new Int16Array(W * Hh);
-    for (let x = 0; x < W; x++) {
-      cost[x] = d[x];
-      back[x] = -1;
-    }
-    for (let y = 1; y < Hh; y++) {
-      const off = y * W,
-        prev = (y - 1) * W;
-      for (let x = 0; x < W; x++) {
-        let bx = x,
-          bc = cost[prev + x];
-        if (x > 0 && cost[prev + x - 1] < bc) {
-          bc = cost[prev + x - 1];
-          bx = x - 1;
+        // DP minimal vertical path (top -> bottom)
+        const W = ow,
+          Hh = oh;
+        const d: Uint8Array = diff.data;
+        const cost = new Float32Array(W * Hh);
+        const back = new Int16Array(W * Hh);
+        for (let x = 0; x < W; x++) {
+          cost[x] = d[x];
+          back[x] = -1;
         }
-        if (x < W - 1 && cost[prev + x + 1] < bc) {
-          bc = cost[prev + x + 1];
-          bx = x + 1;
+        for (let y = 1; y < Hh; y++) {
+          const off = y * W,
+            prev = (y - 1) * W;
+          for (let x = 0; x < W; x++) {
+            let bx = x,
+              bc = cost[prev + x];
+            if (x > 0 && cost[prev + x - 1] < bc) {
+              bc = cost[prev + x - 1];
+              bx = x - 1;
+            }
+            if (x < W - 1 && cost[prev + x + 1] < bc) {
+              bc = cost[prev + x + 1];
+              bx = x + 1;
+            }
+            cost[off + x] = d[off + x] + bc;
+            back[off + x] = bx;
+          }
         }
-        cost[off + x] = d[off + x] + bc;
-        back[off + x] = bx;
+        let endX = 0,
+          best = Infinity;
+        const last = (Hh - 1) * W;
+        for (let x = 0; x < W; x++) {
+          const v = cost[last + x];
+          if (v < best) {
+            best = v;
+            endX = x;
+          }
+        }
+        const s = new Int16Array(Hh);
+        s[Hh - 1] = endX;
+        for (let y = Hh - 1; y > 0; y--) {
+          s[y - 1] = back[y * W + s[y]];
+        }
+        seam = s;
+        diff.delete();
+        wA.delete();
+        wB.delete();
+      } catch (e) {
+        debug("seam: OpenCV path failed; using linear seam fallback for", i, e);
       }
     }
-    let endX = 0,
-      best = Infinity;
-    const last = (Hh - 1) * W;
-    for (let x = 0; x < W; x++) {
-      const v = cost[last + x];
-      if (v < best) {
-        best = v;
-        endX = x;
-      }
+
+    if (!seam) {
+      // Fallback: straight vertical seam centered in overlap ROI
+      const mid = Math.floor(ow / 2);
+      seam = new Int16Array(oh);
+      for (let y = 0; y < oh; y++) seam[y] = mid;
     }
-    const seam = new Int16Array(Hh);
-    seam[Hh - 1] = endX;
-    for (let y = Hh - 1; y > 0; y--) {
-      seam[y - 1] = back[y * W + seam[y]];
-    }
-    diff.delete();
-    wA.delete();
-    wB.delete();
 
     // Decide which side to keep for image B (usually to the right if centers increase)
     const centerA = applyR(HAr, A.width * 0.5, A.height * 0.5);
@@ -2757,6 +2787,47 @@ async function buildSeamMasks(
       ovH,
     });
 
+    // Optionally blur inside ROI space against black background to soften fade without white bleed
+    const blurPxROI = Math.max(0, Math.round(desiredDestFade * scaleX * 0.3));
+    let roiForDraw: HTMLCanvasElement = roiCanvas;
+    if (blurPxROI > 0) {
+      const p = blurPxROI;
+      const padW = ow + 2 * p;
+      const padH = oh + 2 * p;
+      const pad = document.createElement("canvas");
+      pad.width = padW;
+      pad.height = padH;
+      const pc = pad.getContext("2d")!;
+      pc.imageSmoothingEnabled = true;
+      pc.imageSmoothingQuality = "high";
+      // Center
+      pc.drawImage(roiCanvas, p, p);
+      // Replicate edges
+      // Left/right columns
+      pc.drawImage(roiCanvas, 0, 0, 1, oh, 0, p, p, oh);
+      pc.drawImage(roiCanvas, ow - 1, 0, 1, oh, p + ow, p, p, oh);
+      // Top/bottom rows
+      pc.drawImage(roiCanvas, 0, 0, ow, 1, p, 0, ow, p);
+      pc.drawImage(roiCanvas, 0, oh - 1, ow, 1, p, p + oh, ow, p);
+      // Corners
+      pc.drawImage(roiCanvas, 0, 0, 1, 1, 0, 0, p, p);
+      pc.drawImage(roiCanvas, ow - 1, 0, 1, 1, p + ow, 0, p, p);
+      pc.drawImage(roiCanvas, 0, oh - 1, 1, 1, 0, p + oh, p, p);
+      pc.drawImage(roiCanvas, ow - 1, oh - 1, 1, 1, p + ow, p + oh, p, p);
+
+      // Blur padded into ROI-sized canvas by drawing with negative offset
+      const blurred = document.createElement("canvas");
+      blurred.width = ow;
+      blurred.height = oh;
+      const bctx = blurred.getContext("2d")!;
+      bctx.imageSmoothingEnabled = true;
+      bctx.imageSmoothingQuality = "high";
+      bctx.filter = `blur(${blurPxROI}px)`;
+      bctx.drawImage(pad, -p, -p);
+      bctx.filter = "none";
+      roiForDraw = blurred;
+    }
+
     // Compose into a panorama-sized mask
     const maskCanvas = document.createElement("canvas");
     maskCanvas.width = dstW;
@@ -2783,14 +2854,17 @@ async function buildSeamMasks(
     mctx.closePath();
     mctx.fill();
 
-    // Paste the ramp only inside the overlap rectangle
+    // Paste the ramp only inside the overlap rectangle (no blur at this stage)
     mctx.save();
     mctx.beginPath();
     mctx.rect(ov.minX, ov.minY, ovW, ovH);
     mctx.clip();
     mctx.imageSmoothingEnabled = true;
     mctx.imageSmoothingQuality = "high";
-    mctx.drawImage(roiCanvas, ov.minX, ov.minY, ovW, ovH);
+    const prevComp = mctx.globalCompositeOperation;
+    mctx.globalCompositeOperation = "copy"; // overwrite mask strictly within overlap
+    mctx.drawImage(roiForDraw, ov.minX, ov.minY, ovW, ovH);
+    mctx.globalCompositeOperation = prevComp;
     mctx.restore();
 
     const maskBmp = await createImageBitmap(maskCanvas);
@@ -2806,7 +2880,8 @@ async function stitchWithWebGPU(
   bitmaps: ImageBitmap[],
   feather = 60,
   seamWidthPx = 0,
-  setProgress?: (p: number) => void
+  setProgress?: (p: number) => void,
+  debugMask: boolean = false
 ): Promise<string> {
   setProgress?.(5);
   debug("stitch: ensuring WebGPU");
@@ -2990,9 +3065,9 @@ async function stitchWithWebGPU(
     uniformData[14] = dstW;
     uniformData[15] = dstH;
 
-    // feather + explicit pad, then tail padding to hit 80 bytes
+    // feather + debugMask, then tail padding to hit 80 bytes
     uniformData[16] = feather;
-    uniformData[17] = 0.0; // _pad
+    uniformData[17] = debugMask ? 1.0 : 0.0; // debugMask
     uniformData[18] = 0.0; // tail pad
     uniformData[19] = 0.0; // tail pad
 
@@ -3030,6 +3105,13 @@ async function stitchWithWebGPU(
   c.width = dstW;
   c.height = dstH;
   const ctx = c.getContext("2d")!;
+  // Make the final image fully opaque to avoid any fade-to-background artifacts
+  {
+    const data = imageData.data;
+    for (let i = 3; i < data.length; i += 4) {
+      data[i] = 255;
+    }
+  }
   ctx.putImageData(imageData, 0, 0);
 
   setProgress?.(98);
@@ -3080,6 +3162,7 @@ export default function WebGPUPanorama() {
   const [error, setError] = useState<string | null>(null);
   const [maxDim, setMaxDim] = useState<number>(1600);
   const [feather, setFeather] = useState<number>(60);
+  const [showMask, setShowMask] = useState<boolean>(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -3127,8 +3210,12 @@ export default function WebGPUPanorama() {
     setError(null);
     try {
       debug("startStitch: begin");
-      const url = await stitchWithWebGPU(bitmaps, feather, seamWidth, (p) =>
-        setProgress(p)
+      const url = await stitchWithWebGPU(
+        bitmaps,
+        feather,
+        seamWidth,
+        (p) => setProgress(p),
+        showMask
       );
       setResultUrl(url);
       setMode("preview");
@@ -3251,6 +3338,15 @@ export default function WebGPUPanorama() {
                         onChange={(e) =>
                           setSeamWidth(Math.max(0, Number(e.target.value) || 0))
                         }
+                      />
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Label htmlFor="showMask">Debug: Show mask</Label>
+                      <input
+                        id="showMask"
+                        type="checkbox"
+                        checked={showMask}
+                        onChange={(e) => setShowMask(e.target.checked)}
                       />
                     </div>
                   </div>

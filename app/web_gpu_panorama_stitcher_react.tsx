@@ -16,7 +16,6 @@ import {
   ChevronRight,
   Cpu,
   Layers,
-  CheckCircle2,
   TriangleAlert,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -568,7 +567,7 @@ async function loadOpenCV(): Promise<void> {
 
   const INIT_TIMEOUT_MS = 20000;
   const SCRIPT_ID = "opencv-js";
-  const MAX_RETRIES = 0; // avoid double-injection for older builds
+  // const MAX_RETRIES = 0; // avoid double-injection for older builds
 
   const waitForMat = async () => {
     const start = performance.now();

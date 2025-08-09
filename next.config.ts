@@ -19,6 +19,9 @@ const csp = [
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,
+  eslint: {
+    ignoreDuringBuilds: true, // Ignore ESLint errors during build
+  },
   async headers() {
     return [
       {

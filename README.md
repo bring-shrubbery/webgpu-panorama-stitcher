@@ -1,36 +1,100 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# WebGPU Panorama Stitcher (React/Next.js)
 
-## Getting Started
+Panorama stitching **in the browser** — GPU‑accelerated with **WebGPU** and feature matching/seam finding via **OpenCV.js (4.3.0)**. Drop in a sequence of overlapping photos, watch a progress bar, preview the stitched pano, then **download** or **go back** and tweak settings (feather, seam width).
 
-First, run the development server:
+![preview](./preview.png)
+
+---
+
+## ✨ Features
+
+- **Client‑only** panorama pipeline (no server): runs on your GPU in Chrome/Edge/Arc (WebGPU).
+- **Automatic alignment** in cylindrical space:
+  - Auto‑**FOV** estimation per set.
+  - Edge‑based **grid NCC** + 1D/2D refine for robust horizontal shift.
+  - Optional **ECC refine** (small affine) to correct tiny shear/scale.
+- **Smart seams**: DP minimal‑error path through overlaps + adjustable **seam width** fade (in destination pixels).
+- **Feathering controls** + linear sampling & premultiplied blending to avoid halos.
+- **Nice UX** (React + shadcn/ui): multi‑file picker, progress, preview, download, back.
+
+> This project targets “hand‑held yaw” panos with moderate overlap. It does not yet implement full projective bundle adjustment or multi‑band blending (on the roadmap).
+
+---
+
+## 🚀 Quick start
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+pnpm i   # or npm i / yarn
+pnpm dev # http://localhost:3000
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open the app and select 2–12 overlapping images (left→right order helps, but the app can usually infer order from overlaps).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+---
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## 🧱 Requirements
 
-## Learn More
+- **Browser**: WebGPU enabled (Chrome/Edge/Arc ≥113). Safari TP may work with flags.
+- **OpenCV.js 4.3.0** shipped locally (for CORS + CSP sanity):
 
-To learn more about Next.js, take a look at the following resources:
+```
+public/
+  opencv/
+    opencv.js
+    opencv_js.wasm
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+The code expects **`/opencv/opencv.js`** and **`/opencv/opencv_js.wasm`**.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+> Tip: if you see _“expected magic word 00 61 73 6d”_ you are serving an HTML error page instead of the wasm. Verify the file path & content type.
 
-## Deploy on Vercel
+## 🖼️ How it works (high level)
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+1. **Decode & downscale** images for feature work; full‑res kept for final render.
+2. **Auto‑FOV**: try multiple cylindrical FOVs, score overlaps by grid NCC on edge maps, penalize vertical drift → pick best FOV.
+3. **Cylindrical pre‑warp** all inputs using chosen FOV.
+4. **Pairwise alignment** (B→A) in cylindrical space:
+   - grid **NCC on edges** → consensus dx/dy,
+   - 1D column profile + **2D refine** (subpixel),
+   - optional **ECC refine** to small affine,
+   - corner/ORB fallbacks.
+5. **Seam finding**: project overlaps to a small ROI, compute edge‑difference cost, run DP minimal path (top→bottom), then draw a **smooth per‑row ramp** (your **Seam width (px)**) back in _destination_ space.
+6. **WebGPU render**: each image is warped by its 3×3 into the panorama; fragment shader samples the per‑image **mask** (linear) and outputs **premultiplied alpha**; pipeline does `one`/`one‑minus‑src‑alpha` blending.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## 🕹️ UI controls
+
+- **Seam width (px)**: actual crossfade width in the _final panorama_ (converted to ROI internally). If your seam looks hard, bump this (80–180 typical for 1200px tall inputs).
+
+## 📁 Project layout (key bits)
+
+```
+app/
+  page.tsx # UI shell / shadcn components
+  web_gpu_panorama_stitcher_react.tsx
+    - WebGPU pipeline (warp shader, blend)
+    - OpenCV 4.3.0 bridge & alignment
+    - Cylindrical pre‑warp + auto‑FOV
+    - Seam mask builder (DP seam + smooth ramp)
+public/
+  opencv/
+    opencv.js
+    opencv_js.wasm
+```
+
+## 🛣️ Roadmap
+
+- Multiband (Laplacian pyramid) blending for tricky exposure seams.
+- Exposure/color gain compensation across frames.
+- Bundle adjustment / rotation only model fit.
+- Vertical drift correction over long sequences.
+
+## 🙌 Acknowledgements
+
+- **OpenCV.js** (4.3.0) for image ops and ECC.
+- **WebGPU** for fast warping & blending on‑device.
+- **shadcn/ui** for quick, clean UI components.
+
+## Follow me :)
+
+On github: [bring-shrubbery](https://github.com/bring-shrubbery)
+On twitter: [bringshrubberyy](https://x.com/bringshrubberyy)

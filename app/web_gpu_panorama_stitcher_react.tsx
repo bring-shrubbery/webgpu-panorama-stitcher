@@ -5,6 +5,7 @@ import React, {
   useRef,
   useState,
 } from "react";
+import { flushSync } from "react-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Upload,
@@ -758,6 +759,14 @@ async function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
   ]);
 }
 
+// Yield to the browser so React can commit and the Progress bar can paint
+async function yieldToUI() {
+  await new Promise<void>((r) => requestAnimationFrame(() => r()));
+  // Allow another frame for layout/animation (Framer Motion) to settle
+  await new Promise<void>((r) => requestAnimationFrame(() => r()));
+  await new Promise<void>((r) => setTimeout(r, 0));
+}
+
 // ---- Cylindrical projection (pre-warp to reduce perspective/parallax) ----
 // Heuristic focal length in pixels (~60° FOV => ~0.866 * width)
 function guessFocalPx(width: number, fovDeg: number = 60): number {
@@ -1088,7 +1097,8 @@ async function translationScoreEdge(
 
 // Try several FOV candidates and pick the one that yields the strongest, most horizontal alignment
 async function estimateBestFOV(
-  bitmaps: ImageBitmap[]
+  bitmaps: ImageBitmap[],
+  onProgress?: (p01: number) => void
 ): Promise<{ fov: number; log: any }> {
   const n = bitmaps.length;
   const i0 = Math.max(0, Math.min(n - 2, Math.floor(n / 2) - 1));
@@ -1120,18 +1130,27 @@ async function estimateBestFOV(
       bestMetric = metric;
       bestFov = fov;
     }
+    await yieldToUI();
   };
 
-  for (const f of candidates) {
+  // Phase 1: coarse scan
+  for (let i = 0; i < candidates.length; i++) {
+    const f = candidates[i];
     await evalFov(f);
+    onProgress?.(Math.min(0.7, ((i + 1) / candidates.length) * 0.7));
   }
 
   // local refine around current best
   const start = Math.max(30, bestFov - 6),
     end = Math.min(88, bestFov + 6);
-  for (let f = start; f <= end; f += 2) {
-    if (candidates.includes(f)) continue;
+  const refine: number[] = [];
+  for (let f = start; f <= end; f += 2)
+    if (!candidates.includes(f)) refine.push(f);
+  for (let i = 0; i < refine.length; i++) {
+    const f = refine[i];
     await evalFov(f);
+    const frac = 0.7 + ((i + 1) / Math.max(1, refine.length)) * 0.3;
+    onProgress?.(Math.min(1, frac));
   }
 
   if (!isFinite(bestMetric) || bestMetric === -Infinity) {
@@ -2420,13 +2439,64 @@ async function readTextureToImageData(
   return new ImageData(pixels, width, height);
 }
 
+let gpuDevicePromise: Promise<GPUDevice> | null = null;
+let shaderModuleCache: GPUShaderModule | null = null;
+let pipelineCache: GPURenderPipeline | null = null;
+let samplerCache: GPUSampler | null = null;
 async function ensureWebGPU(): Promise<GPUDevice> {
+  if (gpuDevicePromise) return await gpuDevicePromise;
   if (!("gpu" in navigator))
     throw new Error("WebGPU not supported in this browser");
-  const adapter = await (navigator as any).gpu.requestAdapter();
-  if (!adapter) throw new Error("Failed to get GPU adapter");
-  const device = await adapter.requestDevice();
-  return device;
+  gpuDevicePromise = (async () => {
+    const adapter = await (navigator as any).gpu.requestAdapter();
+    if (!adapter) throw new Error("Failed to get GPU adapter");
+    const device = await adapter.requestDevice();
+    return device;
+  })();
+  return await gpuDevicePromise;
+}
+
+function getOrCreateSampler(device: GPUDevice): GPUSampler {
+  if (!samplerCache) {
+    samplerCache = device.createSampler({
+      minFilter: "linear",
+      magFilter: "linear",
+    });
+  }
+  return samplerCache;
+}
+
+function getOrCreatePipeline(device: GPUDevice): GPURenderPipeline {
+  if (pipelineCache) return pipelineCache;
+  if (!shaderModuleCache)
+    shaderModuleCache = device.createShaderModule({ code: warpWGSL });
+  pipelineCache = device.createRenderPipeline({
+    layout: "auto",
+    vertex: { module: shaderModuleCache, entryPoint: "vs_main" },
+    fragment: {
+      module: shaderModuleCache,
+      entryPoint: "fs_main",
+      targets: [
+        {
+          format: "rgba8unorm",
+          blend: {
+            color: {
+              srcFactor: "one",
+              dstFactor: "one-minus-src-alpha",
+              operation: "add",
+            },
+            alpha: {
+              srcFactor: "one",
+              dstFactor: "one-minus-src-alpha",
+              operation: "add",
+            },
+          },
+        },
+      ],
+    },
+    primitive: { topology: "triangle-list" },
+  });
+  return pipelineCache;
 }
 
 // Downscale an ImageBitmap if it's bigger than maxDim
@@ -2881,13 +2951,18 @@ async function stitchWithWebGPU(
   feather = 60,
   seamWidthPx = 0,
   setProgress?: (p: number) => void,
+  setStatus?: (s: string) => void,
   debugMask: boolean = false
 ): Promise<string> {
-  setProgress?.(5);
+  setProgress?.(3);
+  setStatus?.("Initializing WebGPU…");
+  await yieldToUI();
   debug("stitch: ensuring WebGPU");
   const device = await ensureWebGPU();
   debug("stitch: WebGPU ready");
-  setProgress?.(8);
+  setProgress?.(6);
+  setStatus?.("Initializing OpenCV…");
+  await yieldToUI();
 
   // 1) Load OpenCV + compute homographies
   try {
@@ -2895,20 +2970,29 @@ async function stitchWithWebGPU(
   } catch (e) {
     debug("stitch: OpenCV load error", e);
   }
-  setProgress?.(12);
+  setProgress?.(10);
+  setStatus?.("Estimating best FOV…");
+  await yieldToUI();
 
   // Auto-detect FOV on a representative pair, then pre-warp
   debug("stitch: estimating FOV");
-  const { fov } = await estimateBestFOV(bitmaps);
+  const { fov } = await estimateBestFOV(bitmaps, (p01) => {
+    const val = 8 + Math.round(p01 * 4);
+    setProgress?.(val);
+  });
   debug("stitch: cylindrical pre-warp fov", fov);
+  setStatus?.("Pre-warping images (cylindrical)…");
   const cylBitmaps = await cylindricalProjectAll(bitmaps, fov);
+  await yieldToUI();
 
   debug("stitch: computing homographies");
+  setStatus?.("Estimating alignments…");
   const homos = await computeCumulativeHomographies(cylBitmaps, (p) => {
     const val = 12 + Math.round(p * 38);
     debug("progress:", val);
     setProgress?.(val);
   });
+  await yieldToUI();
 
   // If any homography missing, fallback entirely
   if (homos.some((h) => h === null)) {
@@ -2952,6 +3036,7 @@ async function stitchWithWebGPU(
   });
 
   // Build per-image seam masks (destination-space)
+  setStatus?.("Building seam masks…");
   const seamMasks = await buildSeamMasks(
     cylBitmaps,
     finalH,
@@ -2960,6 +3045,7 @@ async function stitchWithWebGPU(
     feather,
     seamWidthPx
   );
+  await yieldToUI();
   // Fallback single-pixel white mask for images without a seam mask
   const whiteMaskBmp = await (async () => {
     const mc = document.createElement("canvas");
@@ -2972,6 +3058,7 @@ async function stitchWithWebGPU(
   })();
 
   setProgress?.(52);
+  setStatus?.("Rendering with WebGPU…");
 
   // 3) GPU setup: target texture & pipeline
   const colorTex = device.createTexture({
@@ -2979,39 +3066,8 @@ async function stitchWithWebGPU(
     format: "rgba8unorm",
     usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
   });
-
-  const sampler = device.createSampler({
-    minFilter: "linear",
-    magFilter: "linear",
-  });
-
-  const module = device.createShaderModule({ code: warpWGSL });
-  const pipeline = device.createRenderPipeline({
-    layout: "auto",
-    vertex: { module, entryPoint: "vs_main" },
-    fragment: {
-      module,
-      entryPoint: "fs_main",
-      targets: [
-        {
-          format: "rgba8unorm",
-          blend: {
-            color: {
-              srcFactor: "one",
-              dstFactor: "one-minus-src-alpha",
-              operation: "add",
-            },
-            alpha: {
-              srcFactor: "one",
-              dstFactor: "one-minus-src-alpha",
-              operation: "add",
-            },
-          },
-        },
-      ],
-    },
-    primitive: { topology: "triangle-list" },
-  });
+  const sampler = getOrCreateSampler(device);
+  const pipeline = getOrCreatePipeline(device);
 
   // 4) Upload source textures and draw each with its inverse homography
   const commandEncoder = device.createCommandEncoder();
@@ -3093,6 +3149,7 @@ async function stitchWithWebGPU(
     const val = 52 + Math.floor(((i + 1) / cylBitmaps.length) * 38);
     debug("progress:", val);
     setProgress?.(val);
+    await yieldToUI();
   }
 
   pass.end();
@@ -3100,6 +3157,7 @@ async function stitchWithWebGPU(
 
   // 5) Read back and convert to data URL
   debug("stitch: readback");
+  setStatus?.("Finalizing image…");
   const imageData = await readTextureToImageData(device, colorTex, dstW, dstH);
   const c = document.createElement("canvas");
   c.width = dstW;
@@ -3118,6 +3176,7 @@ async function stitchWithWebGPU(
   debug("progress:", 98);
   const dataUrl = c.toDataURL("image/png");
   setProgress?.(100);
+  setStatus?.("Done");
   debug("progress:", 100);
   return dataUrl;
 }
@@ -3158,11 +3217,11 @@ export default function WebGPUPanorama() {
     "idle" | "confirm" | "stitching" | "preview"
   >("idle");
   const [progress, setProgress] = useState(0);
+  const [status, setStatus] = useState<string>("");
   const [resultUrl, setResultUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [maxDim, setMaxDim] = useState<number>(1600);
-  const [feather, setFeather] = useState<number>(60);
-  const [showMask, setShowMask] = useState<boolean>(false);
+  const [feather] = useState<number>(60);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -3196,6 +3255,7 @@ export default function WebGPUPanorama() {
   const startOver = useCallback(() => {
     setMode("idle");
     setProgress(0);
+    setStatus("");
     setResultUrl(null);
     setError(null);
     setBitmaps(null);
@@ -3205,35 +3265,76 @@ export default function WebGPUPanorama() {
 
   const startStitch = useCallback(async () => {
     if (!bitmaps || bitmaps.length < 2) return;
-    setMode("stitching");
-    setProgress(0);
-    setError(null);
-    try {
-      debug("startStitch: begin");
-      const url = await stitchWithWebGPU(
-        bitmaps,
-        feather,
-        seamWidth,
-        (p) => setProgress(p),
-        showMask
-      );
-      setResultUrl(url);
-      setMode("preview");
-    } catch (e: any) {
-      console.error(e);
-      debug("startStitch: error", e);
-      setError(e?.message || "Failed to stitch – see console for details.");
-      // Try naive fallback
+    flushSync(() => {
+      setMode("stitching");
+      setProgress(0);
+      setStatus("Preparing…");
+      setError(null);
+    });
+    // Defer heavy work to a new task so the browser can paint the progress bar first
+    setTimeout(() => {
+      (async () => {
+        try {
+          await new Promise<void>((r) => requestAnimationFrame(() => r()));
+          await new Promise<void>((r) => setTimeout(() => r(), 0));
+          debug("startStitch: begin");
+          const url = await stitchWithWebGPU(
+            bitmaps,
+            feather,
+            seamWidth,
+            (p) => setProgress(p),
+            (s) => setStatus(s),
+            false
+          );
+          setResultUrl(url);
+          setMode("preview");
+        } catch (e: any) {
+          console.error(e);
+          debug("startStitch: error", e);
+          setError(e?.message || "Failed to stitch – see console for details.");
+          try {
+            const url = await naiveStitch(bitmaps);
+            setResultUrl(url);
+            setMode("preview");
+          } catch (e2) {
+            console.error("Fallback failed:", e2);
+            setMode("confirm");
+          }
+        }
+      })();
+    }, 0);
+  }, [bitmaps, feather, seamWidth]);
+
+  // Preload OpenCV when images are selected/confirm screen to avoid blocking at stitch start
+  useEffect(() => {
+    let cancelled = false;
+    const kick = async () => {
       try {
-        const url = await naiveStitch(bitmaps);
-        setResultUrl(url);
-        setMode("preview");
-      } catch (e2) {
-        console.error("Fallback failed:", e2);
-        setMode("confirm");
+        // Give UI time to settle
+        await new Promise<void>((r) => requestAnimationFrame(() => r()));
+        await new Promise<void>((r) => setTimeout(r, 0));
+        if (!cancelled)
+          await Promise.all([
+            loadOpenCV(),
+            (async () => {
+              try {
+                const dev = await ensureWebGPU();
+                getOrCreateSampler(dev);
+                getOrCreatePipeline(dev);
+              } catch {}
+            })(),
+          ]);
+      } catch (e) {
+        debug("preload OpenCV error", e);
       }
+    };
+    if (mode === "confirm" && bitmaps && bitmaps.length >= 2) {
+      kick();
     }
-  }, [bitmaps, feather]);
+    return () => {
+      cancelled = true;
+    };
+  }, [mode, bitmaps]);
 
   const download = useCallback(() => {
     if (!resultUrl) return;
@@ -3300,7 +3401,7 @@ export default function WebGPUPanorama() {
                     </Button>
                   </div>
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                    <div>
+                    <div className="space-y-2">
                       <Label htmlFor="maxdim">Max side (px)</Label>
                       <Input
                         id="maxdim"
@@ -3311,44 +3412,25 @@ export default function WebGPUPanorama() {
                         }
                       />
                     </div>
-                    <div>
-                      <Label htmlFor="feather">Feather (px)</Label>
-                      <Input
-                        id="feather"
-                        type="number"
-                        value={feather}
-                        onChange={(e) =>
-                          setFeather(Number(e.target.value || 60))
-                        }
-                      />
-                    </div>
+                    {/* Feather input removed from UI (kept default in code) */}
                     <div className="text-sm text-muted-foreground flex items-end">
                       Images are downscaled for performance. Increase only if
                       you have a beefy GPU.
                     </div>
-                    <div className="flex items-center gap-2">
-                      <Label htmlFor="seamWidth">Seam width (px)</Label>
-                      <Input
-                        id="seamWidth"
-                        type="number"
-                        min={0}
-                        max={800}
-                        className="w-24"
-                        value={seamWidth}
-                        onChange={(e) =>
-                          setSeamWidth(Math.max(0, Number(e.target.value) || 0))
-                        }
-                      />
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <Label htmlFor="showMask">Debug: Show mask</Label>
-                      <input
-                        id="showMask"
-                        type="checkbox"
-                        checked={showMask}
-                        onChange={(e) => setShowMask(e.target.checked)}
-                      />
-                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="seamWidth">Seam width (px)</Label>
+                    <Input
+                      id="seamWidth"
+                      type="number"
+                      min={0}
+                      max={800}
+                      className="w-24"
+                      value={seamWidth}
+                      onChange={(e) =>
+                        setSeamWidth(Math.max(0, Number(e.target.value) || 0))
+                      }
+                    />
                   </div>
                 </div>
               </CardContent>
@@ -3410,7 +3492,7 @@ export default function WebGPUPanorama() {
                   <div className="flex items-center gap-3">
                     <Loader2 className="w-4 h-4 animate-spin" />
                     <div className="text-sm text-muted-foreground">
-                      This may take a minute for large inputs.
+                      {status || "This may take a minute for large inputs."}
                     </div>
                   </div>
                   <Progress value={progress} />

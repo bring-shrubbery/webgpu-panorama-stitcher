@@ -3213,9 +3213,7 @@ export default function WebGPUPanorama() {
   const [seamWidth, setSeamWidth] = useState<number>(48); // pixels in final panorama
   const [files, setFiles] = useState<File[]>([]);
   const [bitmaps, setBitmaps] = useState<ImageBitmap[] | null>(null);
-  const [mode, setMode] = useState<
-    "idle" | "confirm" | "stitching" | "preview"
-  >("idle");
+  const [mode, setMode] = useState<"idle" | "stitching">("idle");
   const [progress, setProgress] = useState(0);
   const [status, setStatus] = useState<string>("");
   const [resultUrl, setResultUrl] = useState<string | null>(null);
@@ -3237,7 +3235,6 @@ export default function WebGPUPanorama() {
         return;
       }
       setFiles(list);
-
       setProgress(5);
       const bms = await filesToBitmaps(list, maxDim, (i, total) =>
         setProgress(Math.floor((i / total) * 20))
@@ -3247,7 +3244,8 @@ export default function WebGPUPanorama() {
         "onSelectFiles: bitmaps prepared",
         bms.map((b) => [b.width, b.height])
       );
-      setMode("confirm");
+      // Stay on the same screen; user will press Start stitching explicitly.
+      setResultUrl(null);
     },
     [maxDim]
   );
@@ -3287,7 +3285,7 @@ export default function WebGPUPanorama() {
             false
           );
           setResultUrl(url);
-          setMode("preview");
+          setMode("idle");
         } catch (e: any) {
           console.error(e);
           debug("startStitch: error", e);
@@ -3295,17 +3293,17 @@ export default function WebGPUPanorama() {
           try {
             const url = await naiveStitch(bitmaps);
             setResultUrl(url);
-            setMode("preview");
+            setMode("idle");
           } catch (e2) {
             console.error("Fallback failed:", e2);
-            setMode("confirm");
+            setMode("idle");
           }
         }
       })();
     }, 0);
   }, [bitmaps, feather, seamWidth]);
 
-  // Preload OpenCV when images are selected/confirm screen to avoid blocking at stitch start
+  // Preload OpenCV/WebGPU when images are selected (no auto-stitch)
   useEffect(() => {
     let cancelled = false;
     const kick = async () => {
@@ -3328,14 +3326,14 @@ export default function WebGPUPanorama() {
         debug("preload OpenCV error", e);
       }
     };
-    if (mode === "confirm" && bitmaps && bitmaps.length >= 2) {
+    if (bitmaps && bitmaps.length >= 2 && mode !== "stitching") {
       kick();
     }
     return () => {
       cancelled = true;
     };
   }, [mode, bitmaps]);
-
+  // Local helpers used below
   const download = useCallback(() => {
     if (!resultUrl) return;
     const a = document.createElement("a");
@@ -3343,7 +3341,6 @@ export default function WebGPUPanorama() {
     a.download = "panorama.png";
     a.click();
   }, [resultUrl]);
-
   const thumbnails = useMemo(() => {
     if (!files.length) return null;
     return files.map((f, i) => (
@@ -3370,116 +3367,6 @@ export default function WebGPUPanorama() {
       </div>
 
       <AnimatePresence mode="wait">
-        {mode === "idle" && (
-          <motion.div
-            key="idle"
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -8 }}
-          >
-            <Card className="border-dashed">
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2">
-                  <Upload className="w-5 h-5" /> Select Images
-                </CardTitle>
-              </CardHeader>
-              <CardContent>
-                <div className="grid gap-4">
-                  <div className="flex items-center gap-4">
-                    <Input
-                      ref={fileInputRef}
-                      type="file"
-                      accept="image/*"
-                      multiple
-                      onChange={(e) => onSelectFiles(e.target.files)}
-                    />
-                    <Button
-                      variant="secondary"
-                      onClick={() => fileInputRef.current?.click()}
-                    >
-                      <ImagePlus className="w-4 h-4 mr-2" /> Choose Files
-                    </Button>
-                  </div>
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                    <div className="space-y-2">
-                      <Label htmlFor="maxdim">Max side (px)</Label>
-                      <Input
-                        id="maxdim"
-                        type="number"
-                        value={maxDim}
-                        onChange={(e) =>
-                          setMaxDim(Number(e.target.value || 1600))
-                        }
-                      />
-                    </div>
-                    {/* Feather input removed from UI (kept default in code) */}
-                    <div className="text-sm text-muted-foreground flex items-end">
-                      Images are downscaled for performance. Increase only if
-                      you have a beefy GPU.
-                    </div>
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="seamWidth">Seam width (px)</Label>
-                    <Input
-                      id="seamWidth"
-                      type="number"
-                      min={0}
-                      max={800}
-                      className="w-24"
-                      value={seamWidth}
-                      onChange={(e) =>
-                        setSeamWidth(Math.max(0, Number(e.target.value) || 0))
-                      }
-                    />
-                  </div>
-                </div>
-
-                <div className="mt-6 text-xs text-muted-foreground">
-                  Tip: For best results, supply overlapping images shot from a
-                  fixed rotation (handheld sweep). If WebGPU or OpenCV isn’t
-                  available, the app will fall back to a simple paste.
-                </div>
-              </CardContent>
-            </Card>
-          </motion.div>
-        )}
-
-        {mode === "confirm" && (
-          <motion.div
-            key="confirm"
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -8 }}
-            className="space-y-4"
-          >
-            <Card>
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2">
-                  <CheckCircle2 className="w-5 h-5" /> Confirm Selection
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-4">
-                <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 gap-3">
-                  {thumbnails}
-                </div>
-                <div className="flex items-center justify-between pt-2">
-                  <div className="text-sm text-muted-foreground">
-                    {files.length} images selected
-                  </div>
-                  <div className="flex gap-2">
-                    <Button variant="ghost" onClick={startOver}>
-                      <ArrowLeft className="w-4 h-4 mr-2" /> Start over
-                    </Button>
-                    <Button onClick={startStitch}>
-                      Start stitching <ChevronRight className="w-4 h-4 ml-2" />
-                    </Button>
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-          </motion.div>
-        )}
-
         {mode === "stitching" && (
           <motion.div
             key="stitching"
@@ -3510,44 +3397,123 @@ export default function WebGPUPanorama() {
             </Card>
           </motion.div>
         )}
+      </AnimatePresence>
 
-        {mode === "preview" && (
-          <motion.div
-            key="preview"
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -8 }}
-            className="space-y-4"
-          >
-            <Card>
-              <CardHeader>
-                <CardTitle>Preview</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-4">
+      {mode === "idle" && (
+        <motion.div
+          key="idle"
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, y: -8 }}
+        >
+          <Card className="border-dashed">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
                 {resultUrl ? (
+                  <>Preview</>
+                ) : (
+                  <>
+                    <Upload className="w-5 h-5" /> Select Images
+                  </>
+                )}
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              {!resultUrl ? (
+                <>
+                  <div className="flex items-center gap-4">
+                    <Input
+                      ref={fileInputRef}
+                      type="file"
+                      accept="image/*"
+                      multiple
+                      onChange={(e) => onSelectFiles(e.target.files)}
+                    />
+                    <Button
+                      variant="secondary"
+                      onClick={() => fileInputRef.current?.click()}
+                    >
+                      <ImagePlus className="w-4 h-4 mr-2" /> Choose Files
+                    </Button>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                    <div>
+                      <Label htmlFor="maxdim">Max side (px)</Label>
+                      <Input
+                        id="maxdim"
+                        type="number"
+                        value={maxDim}
+                        onChange={(e) =>
+                          setMaxDim(Number(e.target.value || 1600))
+                        }
+                      />
+                    </div>
+                    <div className="text-sm text-muted-foreground flex items-end">
+                      Images are downscaled for performance. Increase only if
+                      you have a beefy GPU.
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Label htmlFor="seamWidth">Seam width (px)</Label>
+                      <Input
+                        id="seamWidth"
+                        type="number"
+                        min={0}
+                        max={800}
+                        className="w-24"
+                        value={seamWidth}
+                        onChange={(e) =>
+                          setSeamWidth(Math.max(0, Number(e.target.value) || 0))
+                        }
+                      />
+                    </div>
+                  </div>
+                  {files.length > 0 && (
+                    <div className="space-y-3">
+                      <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 gap-3">
+                        {thumbnails}
+                      </div>
+                      <div className="flex items-center justify-between pt-2">
+                        <div className="text-sm text-muted-foreground">
+                          {files.length} images selected
+                        </div>
+                        <div className="flex gap-2">
+                          <Button variant="ghost" onClick={startOver}>
+                            <ArrowLeft className="w-4 h-4 mr-2" /> Start over
+                          </Button>
+                          <Button
+                            onClick={startStitch}
+                            disabled={!bitmaps || bitmaps.length < 2}
+                          >
+                            Start stitching{" "}
+                            <ChevronRight className="w-4 h-4 ml-2" />
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <>
                   <img
                     src={resultUrl}
                     alt="Panorama result"
                     className="w-full h-auto rounded-xl shadow"
                   />
-                ) : (
-                  <div className="text-sm text-muted-foreground">
-                    No result to show.
+                  <div className="flex items-center justify-between">
+                    <Button variant="ghost" onClick={startOver}>
+                      <ArrowLeft className="w-4 h-4 mr-2" /> Choose different
+                      photos
+                    </Button>
+                    <Button onClick={download}>
+                      <Download className="w-4 h-4 mr-2" /> Download
+                    </Button>
                   </div>
-                )}
-                <div className="flex items-center justify-between">
-                  <Button variant="ghost" onClick={() => setMode("confirm")}>
-                    <ArrowLeft className="w-4 h-4 mr-2" /> Go back
-                  </Button>
-                  <Button onClick={download}>
-                    <Download className="w-4 h-4 mr-2" /> Download
-                  </Button>
-                </div>
-              </CardContent>
-            </Card>
-          </motion.div>
-        )}
-      </AnimatePresence>
+                </>
+              )}
+            </CardContent>
+          </Card>
+        </motion.div>
+      )}
 
       {error && (
         <div className="mt-4 text-sm text-destructive flex items-center gap-2">

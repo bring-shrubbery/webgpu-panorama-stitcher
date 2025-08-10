@@ -17,12 +17,14 @@ import {
   Cpu,
   Layers,
   TriangleAlert,
+  GithubIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import Link from "next/link";
 
 // ---- Debug helpers ----
 const DEBUG = true;
@@ -3360,9 +3362,20 @@ export default function WebGPUPanorama() {
 
   return (
     <div className="mx-auto max-w-5xl p-6">
-      <div className="mb-6 flex items-center gap-3">
-        <Layers className="w-6 h-6 text-primary" />
-        <h1 className="text-2xl font-semibold">WebGPU Panorama Stitcher</h1>
+      <div className="mb-6 flex items-center justify-between w-full">
+        <div className="flex items-center gap-3">
+          <Layers className="w-6 h-6 text-primary" />
+          <h1 className="text-2xl font-semibold">WebGPU Panorama Stitcher</h1>
+        </div>
+
+        <Button asChild variant="ghost" className="p-0 w-10 h-10">
+          <Link
+            href="https://github.com/bring-shrubbery/webgpu-panorama-stitcher"
+            target="_blank"
+          >
+            <GithubIcon className="size-5 min-w-5" />
+          </Link>
+        </Button>
       </div>
 
       <AnimatePresence mode="wait">

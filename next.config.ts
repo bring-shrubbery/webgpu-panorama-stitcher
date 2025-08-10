@@ -7,9 +7,7 @@ const dev = process.env.NODE_ENV !== "production";
 // We also allow 'unsafe-eval' in dev to keep Next.js HMR happy.
 const csp = [
   "default-src 'self'",
-  `script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'${
-    dev ? " 'unsafe-eval'" : ""
-  }`,
+  "script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline' 'unsafe-eval'",
   "worker-src 'self' blob:",
   "img-src 'self' blob: data:",
   "style-src 'self' 'unsafe-inline'",
